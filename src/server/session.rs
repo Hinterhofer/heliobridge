@@ -1499,7 +1499,7 @@ where
             return;
         };
         let before = self.cloud_written.len();
-        for number in start.get()..=end.get() {
+        for number in start.number()..=end.number() {
             let register = Register(number);
             if self.driver.setting(register).is_some() {
                 self.cloud_written.insert(register);
@@ -2500,7 +2500,7 @@ mod tests {
             .awaiting
             .iter()
             .chain(session.reads.iter())
-            .map(|read| read.entry.register().get())
+            .map(|read| read.entry.register().number())
             .collect();
         assert_eq!(
             queued,
