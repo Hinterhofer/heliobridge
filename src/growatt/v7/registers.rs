@@ -877,6 +877,11 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     &[
         Entry::range(250, "charge_limit_upper", 70, 100, Unit::Percent, Verified),
         Entry::range(251, "charge_limit_lower", 0, 30, Unit::Percent, Verified),
+        // NOAH 2000: the system default output power ("Systemstandard-Ausgangsleistung" in the app).
+        // Seen on the wire: changing it in the vendor app from 200 W to 150 W made the cloud send a
+        // write-settings(252), which the device accepted; 322 and slot 1's 257 stayed at 0 W. GroBro
+        // names 252 the same way. Not yet confirmed by watching the output follow it.
+        Entry::range(252, "system_output_power", 0, 1000, Unit::Watt, Confidence::Observed),
         Entry::flag(303, "ac_couple_enabled", Verified),
         Entry::flag(304, "always_on", Verified),
         Entry::flag(305, "ac_output_always_on", Verified),
