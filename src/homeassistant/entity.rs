@@ -1260,8 +1260,10 @@ const NAMED: &[(&str, &str)] = &[
     ("on_grid_power", "On-grid output power"),
     ("off_grid_power", "Off-grid output power"),
     ("default_output_power", "Default output power"),
+    ("system_output_power", "System output power"),
+    // NOAH 2000: what register 2 carries there. See the input register map.
+    ("noah_output_power", "Output power"),
     // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
-    ("internal_faults", "Internal fault flags"),
     ("battery_faults", "Battery fault flags"),
     ("grid_faults", "Grid fault flags"),
     ("output_faults", "Output fault flags"),
@@ -1433,7 +1435,7 @@ mod tests {
         // Bitfields, most of whose bits nobody has seen set: worth exposing so a fault is visible at all,
         // but not on the dashboard, and with nothing about them that suggests a quantity. `Grid faults: 0`
         // reads as a count of faults, and `1024` is not more of anything than `512`.
-        for key in ["internal_faults", "grid_faults", "output_faults", "battery_faults"] {
+        for key in ["grid_faults", "output_faults", "battery_faults"] {
             let entity = reading(key);
             assert_eq!(entity.category, Some(Category::Diagnostic), "{key}");
             assert_eq!(entity.unit, None, "{key}");
@@ -1543,23 +1545,20 @@ mod tests {
         let reading = Entity::meter_reading();
         assert!(reading.gate.is_none(), "the reading input must stay reachable");
 
-        // Its two companions are gated, because both are meaningless with no reading held.
+        // Withdrawing is gated, because it is meaningless with no reading held.
         assert_eq!(
             Entity::withdraw_meter_reading().gate,
             Some(Gate::ReadingIsSet {
                 reading: METER_CONNECTED
             })
         );
+        // The meter's own figure is not: on a NOAH with a paired Shelly 3EM it is live while
+        // `meter_connected` stays 0.
         let active = INPUT_REGISTERS
             .iter()
             .find(|entry| entry.name == "meter_active_power")
             .expect("mapped");
-        assert_eq!(
-            Entity::for_reading(active).expect("an entity").gate,
-            Some(Gate::ReadingIsSet {
-                reading: METER_CONNECTED
-            })
-        );
+        assert_eq!(Entity::for_reading(active).expect("an entity").gate, None);
     }
 
     #[test]
@@ -1632,7 +1631,7 @@ mod tests {
         // state of charge but the first, every string's voltage, the cycle count. Those are the readings a
         // dashboard is built from.
         for key in [
-            "internal_faults",
+            "grid_faults",
             "battery_cell_voltage_max",
             // An accessory an installation either has or has not, and the readback of a switch that is
             // already on the page.
