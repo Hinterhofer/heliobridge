@@ -1518,7 +1518,11 @@ where
         let written = core::mem::take(&mut self.cloud_written);
         let mut queued = 0_usize;
         for register in written {
-            let pending = self.awaiting.iter().chain(self.reads.iter()).any(|read| read.entry.register() == register);
+            let pending = self
+                .awaiting
+                .iter()
+                .chain(self.reads.iter())
+                .any(|read| read.entry.register() == register);
             if pending {
                 continue;
             }
@@ -2474,7 +2478,10 @@ mod tests {
             start: Register(310),
             end: Register(312),
         });
-        assert!(session.cloud_written.is_empty(), "undocumented registers are not read back");
+        assert!(
+            session.cloud_written.is_empty(),
+            "undocumented registers are not read back"
+        );
         assert!(session.cloud_refresh_due.is_none(), "and start no wait");
 
         // A schedule change from the vendor app: the whole of slot 1, then its repeat register.
@@ -2495,7 +2502,11 @@ mod tests {
             .chain(session.reads.iter())
             .map(|read| read.entry.register().get())
             .collect();
-        assert_eq!(queued, vec![254, 255, 256, 257, 258, 342], "341 is undocumented and left alone");
+        assert_eq!(
+            queued,
+            vec![254, 255, 256, 257, 258, 342],
+            "341 is undocumented and left alone"
+        );
         assert!(session.cloud_written.is_empty(), "each register is read once");
 
         // Asking again while they are still queued does not queue them twice.
