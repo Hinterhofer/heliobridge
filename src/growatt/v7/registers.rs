@@ -220,6 +220,13 @@ impl InputRegister {
     }
 
     /// The same entry, meaningless unless `reading` is non-zero.
+    ///
+    /// Unused in this NOAH fork since register 19 lost its gate; kept so upstream's form stays a one-line
+    /// revert.
+    #[expect(
+        dead_code,
+        reason = "kept for register 19 on devices where meter_connected is reliable"
+    )]
     const fn gated_by(mut self, reading: &'static str) -> Self {
         self.gated_by = Some(reading);
         self
