@@ -293,14 +293,14 @@ pub const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// on one that was struggling, so five seconds covers both without holding reads long enough to matter.
 pub const ACK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long after relaying a cloud settings write to read the written registers back.
+/// How long the cloud must have left documented settings alone before the ones it wrote are read back.
 ///
-/// A relayed write is republished as it arrived, so it is not gated by `awaiting_ack`, and a read sent
-/// while the device is still answering it would race the cloud's acknowledgement for the device's single
-/// response slot. Waiting past [`ACK_REPLY_TIMEOUT`] lets that acknowledgement go first. The vendor app
-/// sends a schedule change as several writes a few seconds apart, so each new relayed write restarts the
-/// wait and the registers of all of them are read once, together.
-pub const CLOUD_WRITE_REFRESH_DELAY: Duration = Duration::from_secs(6);
+/// A read in flight when the cloud's next write arrives races that write's acknowledgement for the
+/// device's single response slot, and a lost acknowledgement is what the vendor app reports as a failed
+/// change. The app sends a schedule change as several writes: 341..342 then 254..258 were seen 4 s and
+/// 6.2 s apart, and a 6 s wait fired between them. Twenty seconds of quiet clears that with room to spare;
+/// each further write of a documented setting restarts it, so a burst is read back once, together.
+pub const CLOUD_WRITE_REFRESH_DELAY: Duration = Duration::from_secs(20);
 
 /// Why a session ended.
 #[derive(Debug, Snafu)]
@@ -430,10 +430,10 @@ pub struct Session<S, D: Driver> {
     /// request's code and one of the two is answered to nobody. Observed as a write acknowledgement
     /// arriving under the read function code while the read it displaced timed out.
     ///
-    /// Only this program's own writes are gated. A write the cloud relay passes through is republished as
-    /// it arrived rather than going through [`Session::transmit`], so it is not counted here — the race is
-    /// still possible against one, and closing that would mean decoding every relayed frame to find out
-    /// whether it was a register write.
+    /// Set by this program's own writes in [`Session::transmit`], and by settings writes the cloud relay
+    /// passes through in [`Session::note_cloud_write`] — the relay already classifies every frame, so a
+    /// register write is known without further decoding. What remains open is a read *already sent* when
+    /// a relayed write arrives; that cannot be recalled.
     awaiting_ack: Option<Instant>,
     /// Settings registers the cloud wrote through the relay, waiting to be read back.
     ///
@@ -1498,14 +1498,22 @@ where
         let &Intent::WriteSettings { start, end } = intent else {
             return;
         };
-        let before = self.cloud_written.len();
+        // Whatever it touches, the write is now in flight and owed an acknowledgement, so reads hold off
+        // exactly as they do for one of ours: `write_ack` lifts the hold, `AckTimedOut` at the latest. A
+        // read already sent cannot be recalled; the quiet period below is what keeps that case rare.
+        self.awaiting_ack = Instant::now().checked_add(ACK_REPLY_TIMEOUT);
+
+        let mut touched = false;
         for number in start.number()..=end.number() {
             let register = Register(number);
             if self.driver.setting(register).is_some() {
                 self.cloud_written.insert(register);
+                touched = true;
             }
         }
-        if self.cloud_written.len() > before || self.cloud_refresh_due.is_some() {
+        // Only documented settings restart the wait. The 310..312 the cloud writes every twenty seconds or
+        // so would otherwise keep postponing the read-back indefinitely.
+        if touched {
             self.cloud_refresh_due = Instant::now().checked_add(CLOUD_WRITE_REFRESH_DELAY);
         }
     }
@@ -2483,6 +2491,12 @@ mod tests {
             "undocumented registers are not read back"
         );
         assert!(session.cloud_refresh_due.is_none(), "and start no wait");
+        // But any relayed register write holds reads until it is acknowledged, as one of ours would.
+        assert!(
+            session.awaiting_ack.is_some(),
+            "a relayed write is owed its acknowledgement first"
+        );
+        session.awaiting_ack = None;
 
         // A schedule change from the vendor app: the whole of slot 1, then its repeat register.
         session.note_cloud_write(&Intent::WriteSettings {
