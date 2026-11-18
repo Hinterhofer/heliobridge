@@ -1260,6 +1260,7 @@ const NAMED: &[(&str, &str)] = &[
     ("on_grid_power", "On-grid output power"),
     ("off_grid_power", "Off-grid output power"),
     ("default_output_power", "Default output power"),
+    ("system_output_power", "System output power"),
     // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
     ("internal_faults", "Internal fault flags"),
     ("battery_faults", "Battery fault flags"),
