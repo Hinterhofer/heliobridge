@@ -248,6 +248,29 @@ impl Outcome {
         }
     }
 
+    /// An outcome for a setting command the driver would not express.
+    ///
+    /// The settings counterpart of [`Self::refused`]: nothing was sent, and `refused` tells the caller the
+    /// mistake was theirs rather than the device's.
+    pub fn refused_setting(driver: &impl Catalogue, command: &Command, error: &str) -> Self {
+        let (register, requested) = match command {
+            Command::Set { register, value } => (*register, Some(*value)),
+            Command::Read { register } => (*register, None),
+            _ => (Register(0), None),
+        };
+        let setting = driver.describe(register);
+        Self {
+            name: Some(setting.name()),
+            register: register.number(),
+            requested,
+            stored: None,
+            value: None,
+            confirmed: false,
+            error: Some(error.to_owned()),
+            refused: true,
+        }
+    }
+
     /// An outcome from a value read back off the device.
     pub fn read_back(setting: &impl SettingInfo, requested: Option<Raw>, stored: Raw) -> Self {
         Self {

@@ -438,7 +438,7 @@ mod tests {
     fn a_value_outside_the_registers_domain_is_refused_rather_than_clamped() {
         // The device clamps silently. Refusing is the more useful outcome, and it is the encoder's decision
         // rather than a second copy of the range.
-        let error = parse(r#"{"charge_limit_upper": 10}"#).expect_err("70..=100");
+        let error = parse(r#"{"charge_limit_upper": 10}"#).expect_err("20..=100");
         assert!(matches!(error, CommandError::Domain { .. }), "{error:?}");
     }
 

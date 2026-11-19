@@ -1353,7 +1353,7 @@ mod tests {
         assert_eq!(entity.unit, Some("%"));
         match entity.shape {
             Shape::Numeric(bounds) => {
-                assert_eq!((bounds.min, bounds.max), (70, 100));
+                assert_eq!((bounds.min, bounds.max), (20, 100));
             }
             other => panic!("expected a numeric shape, got {other:?}"),
         }

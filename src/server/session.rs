@@ -1450,7 +1450,20 @@ where
                 self.enqueue_verification(register, None, Some(reply));
             }
             ControlAction::Apply(command) => {
-                let verify = self.transmit(&command).await?;
+                let verify = match self.transmit(&command).await {
+                    Ok(verify) => verify,
+                    // The driver would not express it: a value out of range, an unwritable register. That
+                    // is the caller's mistake and says nothing about the device, so the caller hears about
+                    // it and the session carries on. Ending the session here would drop the device (and the
+                    // cloud relay with it) over a typo.
+                    Err(SessionError::Encode { source }) => {
+                        let reason = format!("the driver would not send that command: {source}");
+                        tracing::warn!(reason, "refused a control request");
+                        drop(reply.send(Outcome::refused_setting(&*self.driver, &command, &reason)));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 if verify.is_empty() {
                     // Nothing to read back — a read or a time push. Answer immediately so the caller is not

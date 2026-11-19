@@ -891,7 +891,9 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     use HoldingRegister as Entry;
 
     &[
-        Entry::range(250, "charge_limit_upper", 70, 100, Unit::Percent, Verified),
+        // NOAH 2000 fork: the vendor app and cloud only offer 70..=100. Widened to 20 to find out whether
+        // that floor is the device's or merely the app's; the device's answer is read back as usual.
+        Entry::range(250, "charge_limit_upper", 20, 100, Unit::Percent, Verified),
         Entry::range(251, "charge_limit_lower", 0, 30, Unit::Percent, Verified),
         // NOAH 2000: the system default output power ("Systemstandard-Ausgangsleistung" in the app).
         // Seen on the wire: changing it in the vendor app from 200 W to 150 W made the cloud send a
