@@ -12,7 +12,7 @@
 //! so a server that sends nothing beyond SUBACK still receives telemetry.
 
 use core::time::Duration;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu};
@@ -293,6 +293,15 @@ pub const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// on one that was struggling, so five seconds covers both without holding reads long enough to matter.
 pub const ACK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the cloud must have left documented settings alone before the ones it wrote are read back.
+///
+/// A read in flight when the cloud's next write arrives races that write's acknowledgement for the
+/// device's single response slot, and a lost acknowledgement is what the vendor app reports as a failed
+/// change. The app sends a schedule change as several writes: 341..342 then 254..258 were seen 4 s and
+/// 6.2 s apart, and a 6 s wait fired between them. Twenty seconds of quiet clears that with room to spare;
+/// each further write of a documented setting restarts it, so a burst is read back once, together.
+pub const CLOUD_WRITE_REFRESH_DELAY: Duration = Duration::from_secs(20);
+
 /// Why a session ended.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -421,11 +430,18 @@ pub struct Session<S, D: Driver> {
     /// request's code and one of the two is answered to nobody. Observed as a write acknowledgement
     /// arriving under the read function code while the read it displaced timed out.
     ///
-    /// Only this program's own writes are gated. A write the cloud relay passes through is republished as
-    /// it arrived rather than going through [`Session::transmit`], so it is not counted here — the race is
-    /// still possible against one, and closing that would mean decoding every relayed frame to find out
-    /// whether it was a register write.
+    /// Set by this program's own writes in [`Session::transmit`], and by settings writes the cloud relay
+    /// passes through in [`Session::note_cloud_write`] — the relay already classifies every frame, so a
+    /// register write is known without further decoding. What remains open is a read *already sent* when
+    /// a relayed write arrives; that cannot be recalled.
     awaiting_ack: Option<Instant>,
+    /// Settings registers the cloud wrote through the relay, waiting to be read back.
+    ///
+    /// Without this a change made in the vendor app reaches the device but not Home Assistant, which keeps
+    /// showing the value from the startup resync until the hourly snapshot or a reconnect.
+    cloud_written: BTreeSet<Register>,
+    /// When to read [`Session::cloud_written`] back. See [`CLOUD_WRITE_REFRESH_DELAY`].
+    cloud_refresh_due: Option<Instant>,
     settings: BTreeMap<Register, Raw>,
     registry: Option<Registry>,
     /// Which device serials may be served. Empty admits any.
@@ -472,7 +488,7 @@ impl<D: Catalogue> PendingRead<D> {
     const fn requested(&self) -> Option<Raw> {
         match self.purpose {
             ReadPurpose::Verify { requested, .. } => requested,
-            ReadPurpose::Resync => None,
+            ReadPurpose::Resync | ReadPurpose::CloudWrite => None,
         }
     }
 
@@ -480,7 +496,7 @@ impl<D: Catalogue> PendingRead<D> {
     fn take_reply(&mut self) -> Option<oneshot::Sender<Outcome>> {
         match &mut self.purpose {
             ReadPurpose::Verify { reply, .. } => reply.take(),
-            ReadPurpose::Resync => None,
+            ReadPurpose::Resync | ReadPurpose::CloudWrite => None,
         }
     }
 }
@@ -497,6 +513,9 @@ enum ReadPurpose {
         /// Where to report the result.
         reply: Option<oneshot::Sender<Outcome>>,
     },
+    /// Learning what a write relayed from the cloud left in the register. Nobody waits on it; the value
+    /// is stored and published like any other read-back.
+    CloudWrite,
 }
 
 impl<S, D> Session<S, D>
@@ -540,6 +559,8 @@ where
             pending_read: None,
             read_deadline: None,
             awaiting_ack: None,
+            cloud_written: BTreeSet::new(),
+            cloud_refresh_due: None,
             settings: BTreeMap::new(),
             registry: None,
             devices: Devices::default(),
@@ -685,6 +706,12 @@ where
                         "a write went unacknowledged; letting reads resume"
                     );
                     self.awaiting_ack = None;
+                    self.send_pending_read().await?;
+                    continue;
+                }
+                Woke::CloudRefreshDue => {
+                    self.cloud_refresh_due = None;
+                    self.enqueue_cloud_refresh();
                     self.send_pending_read().await?;
                     continue;
                 }
@@ -1016,6 +1043,7 @@ where
             () = Self::at(self.time_push_due) => Woke::TimePushDue,
             () = Self::at(self.read_deadline) => Woke::ReadTimedOut,
             () = Self::at(self.awaiting_ack) => Woke::AckTimedOut,
+            () = Self::at(self.cloud_refresh_due) => Woke::CloudRefreshDue,
             request = Self::from_control(self.requests.as_mut()) => Woke::Control(request),
             message = Self::from_cloud(self.relay.as_mut()) => Woke::FromCloud(message),
             packet = Self::read(&mut self.stream) => Woke::Packet(packet?),
@@ -1298,6 +1326,17 @@ where
                 }
             }
 
+            // Stored and published by `accept_read` already; named here so a change is visible in the log
+            // beside the relayed command that caused it.
+            ReadPurpose::CloudWrite => {
+                tracing::info!(
+                    register = %register,
+                    name = read.entry.name(),
+                    value = %read.entry.decode(stored),
+                    "read back after a cloud write"
+                );
+            }
+
             ReadPurpose::Verify { requested, reply } => {
                 let outcome = Outcome::read_back(&read.entry, requested, stored);
 
@@ -1411,7 +1450,20 @@ where
                 self.enqueue_verification(register, None, Some(reply));
             }
             ControlAction::Apply(command) => {
-                let verify = self.transmit(&command).await?;
+                let verify = match self.transmit(&command).await {
+                    Ok(verify) => verify,
+                    // The driver would not express it: a value out of range, an unwritable register. That
+                    // is the caller's mistake and says nothing about the device, so the caller hears about
+                    // it and the session carries on. Ending the session here would drop the device (and the
+                    // cloud relay with it) over a typo.
+                    Err(SessionError::Encode { source }) => {
+                        let reason = format!("the driver would not send that command: {source}");
+                        tracing::warn!(reason, "refused a control request");
+                        drop(reply.send(Outcome::refused_setting(&*self.driver, &command, &reason)));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 if verify.is_empty() {
                     // Nothing to read back — a read or a time push. Answer immediately so the caller is not
@@ -1448,6 +1500,69 @@ where
         }
 
         self.send_pending_read().await
+    }
+
+    /// Remember the registers a relayed cloud write touched, and (re)start the wait before reading them.
+    ///
+    /// Only registers the driver names as settings are kept: the cloud also writes ranges nobody has
+    /// documented (310..312 every few seconds), and reading those back would be traffic with nothing to
+    /// publish. See [`CLOUD_WRITE_REFRESH_DELAY`] for why the read waits.
+    fn note_cloud_write(&mut self, intent: &Intent) {
+        let &Intent::WriteSettings { start, end } = intent else {
+            return;
+        };
+        // Whatever it touches, the write is now in flight and owed an acknowledgement, so reads hold off
+        // exactly as they do for one of ours: `write_ack` lifts the hold, `AckTimedOut` at the latest. A
+        // read already sent cannot be recalled; the quiet period below is what keeps that case rare.
+        self.awaiting_ack = Instant::now().checked_add(ACK_REPLY_TIMEOUT);
+
+        let mut touched = false;
+        for number in start.number()..=end.number() {
+            let register = Register(number);
+            if self.driver.setting(register).is_some() {
+                self.cloud_written.insert(register);
+                touched = true;
+            }
+        }
+        // Only documented settings restart the wait. The 310..312 the cloud writes every twenty seconds or
+        // so would otherwise keep postponing the read-back indefinitely.
+        if touched {
+            self.cloud_refresh_due = Instant::now().checked_add(CLOUD_WRITE_REFRESH_DELAY);
+        }
+    }
+
+    /// Queue the registers the cloud wrote, behind anything already waiting.
+    ///
+    /// Behind, because nobody is holding a connection open for these. A register already queued or in
+    /// flight is not queued twice: that read will report the value just as well.
+    fn enqueue_cloud_refresh(&mut self) {
+        let written = core::mem::take(&mut self.cloud_written);
+        let mut queued = 0_usize;
+        for register in written {
+            let pending = self
+                .awaiting
+                .iter()
+                .chain(self.reads.iter())
+                .any(|read| read.entry.register() == register);
+            if pending {
+                continue;
+            }
+            let Some(entry) = self.driver.setting(register) else {
+                continue;
+            };
+            self.reads.push_back(PendingRead {
+                entry,
+                purpose: ReadPurpose::CloudWrite,
+            });
+            queued = queued.saturating_add(1);
+        }
+        if queued == 0 {
+            return;
+        }
+        tracing::info!(registers = queued, "reading back settings the cloud wrote");
+        if self.awaiting.is_none() {
+            self.start_next_read();
+        }
     }
 
     /// Queue a register to be read back, ahead of any startup resync still in progress.
@@ -1844,6 +1959,7 @@ where
         // Remembered only once it is certain to be sent, so a refused command cannot absorb the attribution
         // of a later answer.
         self.cloud_commands.remember(&intent, Instant::now());
+        self.note_cloud_write(&intent);
 
         let packet_id = if message.qos == QoS::AtMostOnce {
             None
@@ -1966,6 +2082,8 @@ enum Woke {
     ReadTimedOut,
     /// A write went unacknowledged for too long, so reads may resume.
     AckTimedOut,
+    /// Time to read back what the cloud wrote through the relay.
+    CloudRefreshDue,
     /// The control API asked for something, or stopped.
     Control(Option<ControlRequest>),
     /// The cloud sent something for the device, or the relay stopped.
@@ -2369,6 +2487,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relayed_cloud_write_queues_its_known_settings_for_read_back() {
+        use crate::driver::arbiter::Intent;
+        use crate::driver::catalogue::Setting as _;
+
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut session = Session::new(server, Arc::new(Growatt));
+
+        // The cloud writes 310..312 every few seconds; nothing there is a documented setting.
+        session.note_cloud_write(&Intent::WriteSettings {
+            start: Register(310),
+            end: Register(312),
+        });
+        assert!(
+            session.cloud_written.is_empty(),
+            "undocumented registers are not read back"
+        );
+        assert!(session.cloud_refresh_due.is_none(), "and start no wait");
+        // But any relayed register write holds reads until it is acknowledged, as one of ours would.
+        assert!(
+            session.awaiting_ack.is_some(),
+            "a relayed write is owed its acknowledgement first"
+        );
+        session.awaiting_ack = None;
+
+        // A schedule change from the vendor app: the whole of slot 1, then its repeat register.
+        session.note_cloud_write(&Intent::WriteSettings {
+            start: Register(254),
+            end: Register(258),
+        });
+        session.note_cloud_write(&Intent::WriteSettings {
+            start: Register(341),
+            end: Register(342),
+        });
+        assert!(session.cloud_refresh_due.is_some(), "a known setting starts the wait");
+
+        session.enqueue_cloud_refresh();
+        let queued: Vec<u16> = session
+            .awaiting
+            .iter()
+            .chain(session.reads.iter())
+            .map(|read| read.entry.register().number())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![254, 255, 256, 257, 258, 342],
+            "341 is undocumented and left alone"
+        );
+        assert!(session.cloud_written.is_empty(), "each register is read once");
+
+        // Asking again while they are still queued does not queue them twice.
+        session.note_cloud_write(&Intent::WriteSettings {
+            start: Register(257),
+            end: Register(257),
+        });
+        session.enqueue_cloud_refresh();
+        let again = session.awaiting.iter().chain(session.reads.iter()).count();
+        assert_eq!(again, 6);
+    }
+
+    #[tokio::test]
     async fn answering_a_read_advances_to_the_next_register() {
         let mut script = connect_packet();
         script.extend_from_slice(&subscribe_packet());
@@ -2388,7 +2566,7 @@ mod tests {
             .collect();
 
         // Three reads issued: the initial one, then one after each answer.
-        assert_eq!(reads, vec![250, 251, 303], "each answer should trigger the next read");
+        assert_eq!(reads, vec![250, 251, 252], "each answer should trigger the next read");
         assert_eq!(stats.reads, 2);
         assert_eq!(stats.rejected, 0);
     }

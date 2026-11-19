@@ -1075,10 +1075,10 @@ mod tests {
 
     #[test]
     fn out_of_range_values_are_refused_with_the_field_named() {
-        let err = Command::write(Register(250), 5).expect_err("upper limit starts at 70");
+        let err = Command::write(Register(250), 5).expect_err("upper limit starts at 20");
         let text = err.to_string();
         assert!(text.contains("charge_limit_upper"), "{text}");
-        assert!(text.contains("70..=100"), "{text}");
+        assert!(text.contains("20..=100"), "{text}");
 
         assert!(matches!(
             Command::write(Register(324), 101),

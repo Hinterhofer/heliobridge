@@ -220,6 +220,13 @@ impl InputRegister {
     }
 
     /// The same entry, meaningless unless `reading` is non-zero.
+    ///
+    /// Unused in this NOAH fork since register 19 lost its gate; kept so upstream's form stays a one-line
+    /// revert.
+    #[expect(
+        dead_code,
+        reason = "kept for register 19 on devices where meter_connected is reliable"
+    )]
     const fn gated_by(mut self, reading: &'static str) -> Self {
         self.gated_by = Some(reading);
         self
@@ -291,7 +298,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         //
         // Carried as integers rather than enumerations, so a consumer sees the whole word and can report
         // one it does not recognise verbatim.
-        Entry::int(2, "internal_faults", Observed),
+        //
+        // NOAH 2000: register 2 is not a flags word but the AC output in watts, and register 5 (`ac_power`)
+        // stays at raw 0. Matched against the vendor app and the cloud's output figure to the watt (696/696,
+        // 479/479 W) and at about 94–95 % of PV power while the battery was idle; the "0x0232" it showed as
+        // flags was 562 W. Only `internal_faults` is replaced — this fork serves a NOAH alone.
+        Entry::float(2, "noah_output_power", Watt, Scaling::UNIT, Observed),
         Entry::int(3, "grid_faults", Observed),
         Entry::int(4, "output_faults", Observed),
         Entry::float(5, "ac_power", Watt, Scaling::SIGNED, Verified),
@@ -334,7 +346,11 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // A smart meter's own measurement of grid flow, positive on import. Zero whenever no meter is
         // reporting, whatever the real grid current. Register 20 is adjacent and identically shaped but
         // stays at zero even with a meter reading present.
-        Entry::float(19, "meter_active_power", Watt, Scaling::SIGNED, Observed).gated_by("meter_connected"),
+        //
+        // NOAH 2000 with a Shelly 3EM paired in the vendor app: this carries the meter's net figure (matched
+        // against the 3EM's own total, −136/−137 and −102/−100 W, about 10 s behind it), while
+        // `meter_connected` stays 0 throughout. Gating on that flag hid a live reading, so it is not gated.
+        Entry::float(19, "meter_active_power", Watt, Scaling::SIGNED, Observed),
         Entry::float(20, "unknown_20", Watt, Scaling::SIGNED, Inferred),
         Entry::text(21, "serial_number_part_1", 2, Observed),
         Entry::text(23, "serial_number_part_2", 2, Observed),
@@ -875,8 +891,15 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     use HoldingRegister as Entry;
 
     &[
-        Entry::range(250, "charge_limit_upper", 70, 100, Unit::Percent, Verified),
+        // NOAH 2000 fork: the vendor app and cloud only offer 70..=100. Widened to 20 to find out whether
+        // that floor is the device's or merely the app's; the device's answer is read back as usual.
+        Entry::range(250, "charge_limit_upper", 20, 100, Unit::Percent, Verified),
         Entry::range(251, "charge_limit_lower", 0, 30, Unit::Percent, Verified),
+        // NOAH 2000: the system default output power ("Systemstandard-Ausgangsleistung" in the app).
+        // Seen on the wire: changing it in the vendor app from 200 W to 150 W made the cloud send a
+        // write-settings(252), which the device accepted; 322 and slot 1's 257 stayed at 0 W. GroBro
+        // names 252 the same way. Not yet confirmed by watching the output follow it.
+        Entry::range(252, "system_output_power", 0, 1000, Unit::Watt, Confidence::Observed),
         Entry::flag(303, "ac_couple_enabled", Verified),
         Entry::flag(304, "always_on", Verified),
         Entry::flag(305, "ac_output_always_on", Verified),
