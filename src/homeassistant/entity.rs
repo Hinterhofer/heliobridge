@@ -1687,6 +1687,40 @@ mod tests {
     }
 
     #[test]
+    fn readings_the_noah_holds_at_zero_are_gated_on_themselves() {
+        // At raw 0 the offset encodings render −30000 W, −300 A and −273.1 °C; gated, they show as
+        // unavailable instead, and come back on their own if the device ever fills them.
+        for key in [
+            "ac_power",
+            "pv3_temp",
+            "pv4_temp",
+            "off_grid_current",
+            "off_grid_power",
+            "battery_voltage",
+            "inverter_temp",
+            "grid_voltage",
+            "on_grid_power",
+            "grid_current",
+            "battery_current",
+        ] {
+            assert_eq!(reading(key).gate, Some(Gate::ReadingIsSet { reading: key }), "{key}");
+        }
+        assert_eq!(reading("noah_output_power").gate, None);
+        assert_eq!(reading("pv1_temp").gate, None);
+    }
+
+    #[test]
+    fn the_noah_pack_voltage_and_bms_limits_are_published() {
+        let pack = reading("battery_pack_voltage");
+        assert_eq!(pack.device_class, Some("voltage"));
+        assert_eq!(pack.unit, Some("V"));
+        assert_eq!(pack.precision, Some(2));
+        assert_eq!(pack.category, None);
+        assert_eq!(reading("battery_charge_voltage_limit").device_class, Some("voltage"));
+        assert_eq!(reading("battery_current_limit").device_class, Some("current"));
+    }
+
+    #[test]
     fn the_heater_state_is_shown_as_the_word_the_battery_sends() {
         // One bit per pack, so which packs are heating reads at a glance in hexadecimal.
         let heater = reading(HEATER_STATE);
