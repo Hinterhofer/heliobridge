@@ -348,12 +348,14 @@ mod tests {
         }
     }
 
-    /// An ordinary telemetry register, for the availability tests.
+    /// An ordinary, ungated telemetry register, for the availability tests.
+    ///
+    /// `pv_power_total` rather than `ac_power`, which this NOAH fork gates on itself.
     fn ac_power() -> InputRegister {
         *INPUT_REGISTERS
             .iter()
-            .find(|entry| entry.name == "ac_power")
-            .expect("ac_power is mapped")
+            .find(|entry| entry.name == "pv_power_total")
+            .expect("pv_power_total is mapped")
     }
 
     #[test]
