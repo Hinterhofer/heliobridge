@@ -565,11 +565,11 @@ mod tests {
     fn an_object_serialises_to_what_a_value_template_can_read() {
         let view = TelemetryView {
             timestamp: None,
-            readings: vec![reading("ac_power", "-100")],
+            readings: vec![reading("pv_power_total", "-100")],
         };
         let bytes = StatePayload::telemetry(&view, &fields(), None).into_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(parsed["ac_power"], json!(-100));
+        assert_eq!(parsed["pv_power_total"], json!(-100));
     }
 
     #[test]

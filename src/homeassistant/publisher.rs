@@ -1490,6 +1490,10 @@ mod tests {
         settle().await;
         wire.session.telemetry.send_replace(Some(frame("-100")));
         settle().await;
+        // What the frame published, so the queue has room for what going quiet publishes: the
+        // announcement and the gates it opened would otherwise fill it, which a broker draining as it
+        // goes never lets happen.
+        wire.drain();
         tokio::time::advance(OFFLINE_AFTER.saturating_add(Duration::from_secs(1))).await;
         settle().await;
 
