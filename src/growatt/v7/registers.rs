@@ -39,8 +39,10 @@ pub const INPUT_BASE_OFFSET: usize = 0x4F;
 /// The telemetry reading that is non-zero while the device holds a meter figure it is acting on.
 pub const METER_CONNECTED: &str = "meter_connected";
 
-/// The telemetry reading that is non-zero once the BMS has joined: the pack count, which a NOAH reports as 0
-/// for its first half hour or so after waking on PV, while every battery figure in the frame is filler.
+/// The telemetry reading that is non-zero once the BMS has joined.
+///
+/// The pack count, which a NOAH reports as 0 for its first half hour or so after waking on PV, while every
+/// battery figure in the frame is filler.
 pub const BMS_REPORTING: &str = "battery_pack_count";
 
 /// The config register holding accessories reached over the local network.
