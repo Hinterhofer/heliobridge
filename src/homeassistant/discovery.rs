@@ -489,9 +489,12 @@ mod tests {
 
     #[test]
     fn a_reading_names_its_field_its_unit_and_both_availability_topics() {
-        let config = payload(&entity("ac_power"));
+        let config = payload(&entity("pv_power_total"));
         assert_eq!(config["state_topic"], "heliobridge/0EXAMPLE00000001/state");
-        assert_eq!(config["value_template"], "{{ value_json.ac_power | default('') }}");
+        assert_eq!(
+            config["value_template"],
+            "{{ value_json.pv_power_total | default('') }}"
+        );
         assert_eq!(config["unit_of_measurement"], "W");
         assert_eq!(config["device_class"], "power");
         assert_eq!(config["state_class"], "measurement");
@@ -604,7 +607,7 @@ mod tests {
     #[test]
     fn a_number_carries_the_registers_own_bounds_and_a_command_template() {
         let config = payload(&entity("charge_limit_upper"));
-        assert_eq!(config["min"], 70);
+        assert_eq!(config["min"], 20);
         assert_eq!(config["max"], 100);
         assert_eq!(config["step"], 1);
         assert_eq!(config["command_topic"], "heliobridge/0EXAMPLE00000001/set");

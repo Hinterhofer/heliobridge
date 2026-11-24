@@ -39,6 +39,12 @@ pub const INPUT_BASE_OFFSET: usize = 0x4F;
 /// The telemetry reading that is non-zero while the device holds a meter figure it is acting on.
 pub const METER_CONNECTED: &str = "meter_connected";
 
+/// The telemetry reading that is non-zero once the BMS has joined.
+///
+/// The pack count, which a NOAH reports as 0 for its first half hour or so after waking on PV, while every
+/// battery figure in the frame is filler.
+pub const BMS_REPORTING: &str = "battery_pack_count";
+
 /// The config register holding accessories reached over the local network.
 pub const ACCESSORY_LIST: &str = "accessory_list";
 
@@ -220,6 +226,8 @@ impl InputRegister {
     }
 
     /// The same entry, meaningless unless `reading` is non-zero.
+    ///
+    /// In this NOAH fork it gates the registers the device holds at raw 0 on themselves.
     const fn gated_by(mut self, reading: &'static str) -> Self {
         self.gated_by = Some(reading);
         self
@@ -291,10 +299,25 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         //
         // Carried as integers rather than enumerations, so a consumer sees the whole word and can report
         // one it does not recognise verbatim.
-        Entry::int(2, "internal_faults", Observed),
+        //
+        // NOAH 2000: registers this device holds at raw 0 in every frame (5, 105, 108, 110–113, 115–118)
+        // are gated on themselves, so Home Assistant shows them unavailable instead of the offset of the
+        // encoding (−30000 W, −300 A, −273.1 °C); one that ever turns non-zero becomes available.
+        //
+        // NOAH 2000: register 2 is not a flags word but the AC output in watts, and register 5 (`ac_power`)
+        // stays at raw 0. Matched against the vendor app and the cloud's output figure to the watt (696/696,
+        // 479/479 W) and at about 94–95 % of PV power while the battery was idle; the "0x0232" it showed as
+        // flags was 562 W. Only `internal_faults` is replaced — this fork serves a NOAH alone.
+        // NOAH 2000: for the first 25 to 27 minutes after waking on PV the BMS has not joined, and the
+        // frame says so with `battery_pack_count` at 0. Every battery figure in those frames is filler:
+        // SoC 0, cells 0 V, pack 7–40 V, BMS limits 45 V / 3 A, cycles 0, the PV energy counters 0 and the
+        // off-grid voltage 28 V. Gated on the pack count, so they are left out of the state and show
+        // unavailable instead; the energy counters especially, which Home Assistant would read as a meter
+        // reset and count again.
+        Entry::float(2, "noah_output_power", Watt, Scaling::UNIT, Observed),
         Entry::int(3, "grid_faults", Observed),
         Entry::int(4, "output_faults", Observed),
-        Entry::float(5, "ac_power", Watt, Scaling::SIGNED, Verified),
+        Entry::float(5, "ac_power", Watt, Scaling::SIGNED, Verified).gated_by("ac_power"),
         // Whether a smart meter is currently reporting. Rises one telemetry cycle after a reading reaches
         // the device and clears about 123 s after the last one, which is the reading's lifetime. It is what
         // separates a genuine reading of 0 W from no meter at all, since register 19 shows 0 for both.
@@ -303,8 +326,8 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::enumerated(8, "work_mode", WORK_MODE_LABELS, Verified),
         Entry::enumerated(10, "battery_charge_status", BATTERY_STATUS_LABELS, Observed),
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
-        Entry::int(12, "battery_pack_count", Observed),
-        Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
+        Entry::int(12, "battery_pack_count", Observed).gated_by(BMS_REPORTING),
+        Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified).gated_by(BMS_REPORTING),
         // The BMS's `HeatState`, relayed unchanged: bit n is set while pack n+1's heater relay is on, read
         // out of the BMS's reply builder. The heater runs only while charging, below 3.1 or 5.1 °C depending
         // on the hardware variant. Seen 0 → 1 → 0 across a heating cycle that started at 0 °C, in step with
@@ -334,14 +357,18 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // A smart meter's own measurement of grid flow, positive on import. Zero whenever no meter is
         // reporting, whatever the real grid current. Register 20 is adjacent and identically shaped but
         // stays at zero even with a meter reading present.
-        Entry::float(19, "meter_active_power", Watt, Scaling::SIGNED, Observed).gated_by("meter_connected"),
+        //
+        // NOAH 2000 with a Shelly 3EM paired in the vendor app: this carries the meter's net figure (matched
+        // against the 3EM's own total, −136/−137 and −102/−100 W, about 10 s behind it), while
+        // `meter_connected` stays 0 throughout. Gating on that flag hid a live reading, so it is not gated.
+        Entry::float(19, "meter_active_power", Watt, Scaling::SIGNED, Observed),
         Entry::float(20, "unknown_20", Watt, Scaling::SIGNED, Inferred),
         Entry::text(21, "serial_number_part_1", 2, Observed),
         Entry::text(23, "serial_number_part_2", 2, Observed),
         Entry::text(25, "serial_number_part_3", 2, Observed),
         Entry::text(27, "serial_number_part_4", 2, Observed),
-        Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified),
-        Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified).gated_by(BMS_REPORTING),
+        Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified).gated_by(BMS_REPORTING),
         Entry::float(41, "battery2_soc", Percent, Scaling::UNIT, Observed),
         // The per-pack block repeats every 12 registers, so the temperature of pack n sits one past its
         // state of charge. Inferred from that symmetry alone: the reference device has one pack, which
@@ -355,10 +382,10 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // so a 16-bit read of the low half alone gives the same answer today and a wrong one past
         // 6553.5 kWh. Named for what they count: another implementation calls these PV energy, and the
         // day's figures agree — production exceeds AC output by what went into the battery.
-        Entry::float32(71, "pv_energy_today", KilowattHour, Scaling::TENTHS, Verified),
-        Entry::float32(73, "pv_energy_month", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float32(75, "pv_energy_year", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float32(77, "pv_energy_total", KilowattHour, Scaling::TENTHS, Verified),
+        Entry::float32(71, "pv_energy_today", KilowattHour, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
+        Entry::float32(73, "pv_energy_month", KilowattHour, Scaling::TENTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float32(75, "pv_energy_year", KilowattHour, Scaling::TENTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float32(77, "pv_energy_total", KilowattHour, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
         // Daily counters, reset at midnight. 79 and 80 separate cleanly by the sign of register 11:
         // across 12 426 frames, 80 rose only while charging and 79 only while discharging, without
         // exception. The scaling is confirmed by capacity — 80 rising 17 over a 5..100 % climb implies
@@ -402,55 +429,65 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(96, "pv2_current", Ampere, Scaling::HUNDREDTHS, Observed),
         Entry::float(97, "pv2_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(98, "device_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
-        Entry::float(99, "battery_cell_voltage_max", Volt, Scaling::THOUSANDTHS, Observed),
-        Entry::float(100, "battery_cell_voltage_min", Volt, Scaling::THOUSANDTHS, Observed),
-        Entry::int(101, "battery_cycles", Observed),
-        Entry::float(102, "battery_soh", Percent, Scaling::UNIT, Observed),
+        Entry::float(99, "battery_cell_voltage_max", Volt, Scaling::THOUSANDTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float(100, "battery_cell_voltage_min", Volt, Scaling::THOUSANDTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::int(101, "battery_cycles", Observed).gated_by(BMS_REPORTING),
+        Entry::float(102, "battery_soh", Percent, Scaling::UNIT, Observed).gated_by(BMS_REPORTING),
         Entry::float(103, "pv3_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(104, "pv3_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(105, "pv3_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        Entry::float(105, "pv3_temp", Celsius, Scaling::KELVIN_TENTHS, Verified).gated_by("pv3_temp"),
         Entry::float(106, "pv4_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(107, "pv4_current", Ampere, Scaling::HUNDREDTHS, Observed),
-        Entry::float(108, "pv4_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        Entry::float(108, "pv4_temp", Celsius, Scaling::KELVIN_TENTHS, Verified).gated_by("pv4_temp"),
         // 110, 111 and 117 use the signed-power encoding, so they are probably power values.
         // The off-grid output: what the device's own socket delivers, and zero in every frame until the
         // device is put into off-grid mode. Established by connecting a lamp, then two: voltage held
         // 230.0 V, current and power both roughly doubled, and 111 matched |ac_power| to the decimal.
-        Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified),
-        Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified),
-        Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
+        Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
+        Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified)
+            .gated_by("off_grid_current"),
+        Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified).gated_by("off_grid_power"),
         // The pack voltage, and the other half of the DC-side measurement `battery_current` begins.
         // Identified against the cells rather than from the firmware, which does not copy the BMS's
         // `VoltageSum` anywhere: it holds to 16 × the mean cell voltage in 99.85 % of 408 402 frames,
         // over a 22.0 to 58.3 V span, which no setpoint would do. The median ratio of 0.9964 is the mean
         // of the highest and lowest cell overstating the true mean, not an error in the scale.
-        Entry::float(112, "battery_voltage", Volt, Scaling::TENTHS, Observed),
+        Entry::float(112, "battery_voltage", Volt, Scaling::TENTHS, Observed).gated_by("battery_voltage"),
         // The inverter's own temperature, which the sub-MCU calls `INV_TEMP` and biases the same way it
         // biases the pack temperatures. Distinct from `device_temp`: across the capture this runs
         // 11.8 to 74.7 °C while `device_temp` peaks at 51.1 °C, which is a heatsink against a board.
-        Entry::float(113, "inverter_temp", Celsius, Scaling::KELVIN_TENTHS, Observed),
+        Entry::float(113, "inverter_temp", Celsius, Scaling::KELVIN_TENTHS, Observed).gated_by("inverter_temp"),
         Entry::float(114, "unknown_114", NoUnit, Scaling::UNIT, Inferred),
-        Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed),
+        Entry::float(115, "grid_voltage", Volt, Scaling::HUNDREDTHS, Observed).gated_by("grid_voltage"),
         // The on-grid half: zero while the device runs off-grid, which is what separates it from
         // register 5. Register 5 reports whichever output is live; this one only the grid.
-        Entry::float(116, "on_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified),
+        Entry::float(116, "on_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified).gated_by("on_grid_power"),
         // Grid current, and the sign is the opposite of `ac_power`'s. Dividing `ac_power` by it gives
         // 230.4 V against a measured grid voltage of 233.1 V, which is what fixes the hundredth-amp
         // scale. It carries no information `ac_power` does not — the two correlate at −0.9994 — so it is
         // here to be correct rather than because a dashboard needs it.
-        Entry::float(117, "grid_current", Ampere, Scaling::new(0.01, -300.0), Observed),
+        Entry::float(117, "grid_current", Ampere, Scaling::new(0.01, -300.0), Observed).gated_by("grid_current"),
         // The battery's own current, and with `battery_voltage` the whole of what this device measures on
         // the DC side: `battery_charge_power` is taken on the AC side of the converter, and
         // `battery_soc_total` comes from a gauge that drifts. Positive while charging, and ±17.6 A at the
         // extremes — which at pack voltage is the 800 to 1000 W the hardware is rated for, and is what
         // settles the scale as tenths of an amp rather than hundredths or units. Multiplied by 112 it
         // tracks `battery_charge_power` at 0.9989, the two differing by the converter's losses.
-        Entry::float(118, "battery_current", Ampere, Scaling::new(0.1, -3000.0), Observed),
+        Entry::float(118, "battery_current", Ampere, Scaling::new(0.1, -3000.0), Observed).gated_by("battery_current"),
         // Four component versions in two registers, one per octet. Together with the datalogger's own
         // version they make the six-field string the vendor identifies a release by; see
         // `super::version`. Not published as entities in their own right — the assembled version is.
         Entry::int(119, "inverter_mppt_version", Verified),
         Entry::int(120, "pd_bms_version", Verified),
+        // NOAH 2000: the DC side lives beyond the documented block. 150 is the pack voltage in hundredths
+        // of a volt — 51.0 to 56.0 V across 15 461 frames, rising while charging and falling while
+        // discharging, within ~0.5 V of 16 × the mean cell voltage — while register 112 stays at raw 0.
+        // 148 sits at 58.40 V (45.00 V right after a wake-up), which reads as the BMS's charge voltage
+        // limit. 149 steps through 41, 21, 9, 3 and 1 A, dropping to 1 A at 97–100 % state of charge,
+        // which reads as the BMS's current limit. Both of those meanings are inferred, not confirmed.
+        Entry::float(148, "battery_charge_voltage_limit", Volt, Scaling::HUNDREDTHS, Inferred).gated_by(BMS_REPORTING),
+        Entry::float(149, "battery_current_limit", Ampere, Scaling::HUNDREDTHS, Inferred).gated_by(BMS_REPORTING),
+        Entry::float(150, "battery_pack_voltage", Volt, Scaling::HUNDREDTHS, Observed).gated_by(BMS_REPORTING),
     ]
 };
 
@@ -875,8 +912,15 @@ pub const HOLDING_REGISTERS: &[HoldingRegister] = {
     use HoldingRegister as Entry;
 
     &[
-        Entry::range(250, "charge_limit_upper", 70, 100, Unit::Percent, Verified),
+        // NOAH 2000 fork: the vendor app and cloud only offer 70..=100. Widened to 20 to find out whether
+        // that floor is the device's or merely the app's; the device's answer is read back as usual.
+        Entry::range(250, "charge_limit_upper", 20, 100, Unit::Percent, Verified),
         Entry::range(251, "charge_limit_lower", 0, 30, Unit::Percent, Verified),
+        // NOAH 2000: the system default output power ("Systemstandard-Ausgangsleistung" in the app).
+        // Seen on the wire: changing it in the vendor app from 200 W to 150 W made the cloud send a
+        // write-settings(252), which the device accepted; 322 and slot 1's 257 stayed at 0 W. GroBro
+        // names 252 the same way. Not yet confirmed by watching the output follow it.
+        Entry::range(252, "system_output_power", 0, 1000, Unit::Watt, Confidence::Observed),
         Entry::flag(303, "ac_couple_enabled", Verified),
         Entry::flag(304, "always_on", Verified),
         Entry::flag(305, "ac_output_always_on", Verified),

@@ -727,12 +727,18 @@ impl<D: Registers + Describes> Link<D> {
     /// What the device reports, and one until it has: it is a battery, so it has at least that. Not an
     /// `Option`, because "unknown" and "one" would build two catalogues with identical contents — and each
     /// distinct catalogue costs an announcement of every entity in it.
+    ///
+    /// A count of 0 keeps whatever was announced before. A NOAH reports 0 for its first half hour or so
+    /// after waking on PV, until its BMS joins; taking that at its word would withdraw every per-pack
+    /// entity each morning and announce them again once the pack turned up.
     fn packs(&self) -> u16 {
         self.session
             .telemetry
             .borrow()
             .as_ref()
             .and_then(|view| reading(view, "battery_pack_count"))
+            .filter(|&count| count > 0)
+            .or_else(|| self.announced.as_ref().map(|announced| announced.catalogue.packs))
             .unwrap_or(1)
     }
 
@@ -1484,6 +1490,10 @@ mod tests {
         settle().await;
         wire.session.telemetry.send_replace(Some(frame("-100")));
         settle().await;
+        // What the frame published, so the queue has room for what going quiet publishes: the
+        // announcement and the gates it opened would otherwise fill it, which a broker draining as it
+        // goes never lets happen.
+        wire.drain();
         tokio::time::advance(OFFLINE_AFTER.saturating_add(Duration::from_secs(1))).await;
         settle().await;
 

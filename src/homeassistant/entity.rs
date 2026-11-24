@@ -180,6 +180,11 @@ pub const SOC_CREDIBLE: &str = "battery_soc_credible";
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
 
+/// The reading that is non-zero once the BMS has joined, which the figures computed from the cells wait for.
+///
+/// In this NOAH fork: the pack count, 0 for the first half hour or so after the device wakes on PV.
+pub const BMS_REPORTING: &str = "battery_pack_count";
+
 /// The reading that says whether the device is actually running off-grid, as against told to.
 pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
 
@@ -702,7 +707,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -728,7 +734,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -756,7 +763,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -1260,8 +1268,10 @@ const NAMED: &[(&str, &str)] = &[
     ("on_grid_power", "On-grid output power"),
     ("off_grid_power", "Off-grid output power"),
     ("default_output_power", "Default output power"),
+    ("system_output_power", "System output power"),
+    // NOAH 2000: what register 2 carries there. See the input register map.
+    ("noah_output_power", "Output power"),
     // "Grid faults: 0" reads as a count of faults. These are words of flags, and the label has to say so.
-    ("internal_faults", "Internal fault flags"),
     ("battery_faults", "Battery fault flags"),
     ("grid_faults", "Grid fault flags"),
     ("output_faults", "Output fault flags"),
@@ -1278,8 +1288,8 @@ const NAMED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source,
-        StateClass, VERSION_PARTS,
+        BMS_REPORTING, Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE,
+        Shape, Source, StateClass, VERSION_PARTS,
     };
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
@@ -1351,7 +1361,7 @@ mod tests {
         assert_eq!(entity.unit, Some("%"));
         match entity.shape {
             Shape::Numeric(bounds) => {
-                assert_eq!((bounds.min, bounds.max), (70, 100));
+                assert_eq!((bounds.min, bounds.max), (20, 100));
             }
             other => panic!("expected a numeric shape, got {other:?}"),
         }
@@ -1433,7 +1443,7 @@ mod tests {
         // Bitfields, most of whose bits nobody has seen set: worth exposing so a fault is visible at all,
         // but not on the dashboard, and with nothing about them that suggests a quantity. `Grid faults: 0`
         // reads as a count of faults, and `1024` is not more of anything than `512`.
-        for key in ["internal_faults", "grid_faults", "output_faults", "battery_faults"] {
+        for key in ["grid_faults", "output_faults", "battery_faults"] {
             let entity = reading(key);
             assert_eq!(entity.category, Some(Category::Diagnostic), "{key}");
             assert_eq!(entity.unit, None, "{key}");
@@ -1543,23 +1553,20 @@ mod tests {
         let reading = Entity::meter_reading();
         assert!(reading.gate.is_none(), "the reading input must stay reachable");
 
-        // Its two companions are gated, because both are meaningless with no reading held.
+        // Withdrawing is gated, because it is meaningless with no reading held.
         assert_eq!(
             Entity::withdraw_meter_reading().gate,
             Some(Gate::ReadingIsSet {
                 reading: METER_CONNECTED
             })
         );
+        // The meter's own figure is not: on a NOAH with a paired Shelly 3EM it is live while
+        // `meter_connected` stays 0.
         let active = INPUT_REGISTERS
             .iter()
             .find(|entry| entry.name == "meter_active_power")
             .expect("mapped");
-        assert_eq!(
-            Entity::for_reading(active).expect("an entity").gate,
-            Some(Gate::ReadingIsSet {
-                reading: METER_CONNECTED
-            })
-        );
+        assert_eq!(Entity::for_reading(active).expect("an entity").gate, None);
     }
 
     #[test]
@@ -1632,7 +1639,7 @@ mod tests {
         // state of charge but the first, every string's voltage, the cycle count. Those are the readings a
         // dashboard is built from.
         for key in [
-            "internal_faults",
+            "grid_faults",
             "battery_cell_voltage_max",
             // An accessory an installation either has or has not, and the readback of a switch that is
             // already on the page.
@@ -1685,6 +1692,81 @@ mod tests {
         assert_eq!(reading("inverter_temp").device_class, Some("temperature"));
         assert_eq!(reading("inverter_temp").precision, Some(1));
         assert_ne!(reading("inverter_temp").name, reading("device_temp").name);
+    }
+
+    #[test]
+    fn readings_the_noah_holds_at_zero_are_gated_on_themselves() {
+        // At raw 0 the offset encodings render −30000 W, −300 A and −273.1 °C; gated, they show as
+        // unavailable instead, and come back on their own if the device ever fills them.
+        for key in [
+            "ac_power",
+            "pv3_temp",
+            "pv4_temp",
+            "off_grid_current",
+            "off_grid_power",
+            "battery_voltage",
+            "inverter_temp",
+            "grid_voltage",
+            "on_grid_power",
+            "grid_current",
+            "battery_current",
+        ] {
+            assert_eq!(reading(key).gate, Some(Gate::ReadingIsSet { reading: key }), "{key}");
+        }
+        assert_eq!(reading("noah_output_power").gate, None);
+        assert_eq!(reading("pv1_temp").gate, None);
+    }
+
+    #[test]
+    fn battery_figures_wait_for_the_bms_to_join() {
+        // A NOAH reports 0 packs for its first half hour after waking on PV, with filler in every battery
+        // figure beside it, so each of them is gated on the pack count.
+        for key in [
+            "battery_pack_count",
+            "battery_soc_total",
+            "battery1_soc",
+            "battery1_temp",
+            "pv_energy_today",
+            "pv_energy_month",
+            "pv_energy_year",
+            "pv_energy_total",
+            "battery_cell_voltage_max",
+            "battery_cell_voltage_min",
+            "battery_cycles",
+            "battery_soh",
+            "off_grid_voltage",
+            "battery_charge_voltage_limit",
+            "battery_current_limit",
+            "battery_pack_voltage",
+        ] {
+            assert_eq!(
+                reading(key).gate,
+                Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
+                "{key}"
+            );
+        }
+        for entity in [Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()] {
+            assert_eq!(
+                entity.gate,
+                Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
+                "{}",
+                entity.key
+            );
+        }
+        // The PV side reports before the BMS joins, and is right.
+        assert_eq!(reading("pv_power_total").gate, None);
+        assert_eq!(reading("pv1_voltage").gate, None);
+    }
+
+    #[test]
+    fn the_noah_pack_voltage_and_bms_limits_are_published() {
+        let pack = reading("battery_pack_voltage");
+        assert_eq!(pack.device_class, Some("voltage"));
+        assert_eq!(pack.unit, Some("V"));
+        assert_eq!(pack.precision, Some(2));
+        assert_eq!(pack.category, None);
+        assert_eq!(reading("battery_charge_voltage_limit").device_class, Some("voltage"));
+        assert_eq!(reading("battery_current_limit").device_class, Some("current"));
     }
 
     #[test]
