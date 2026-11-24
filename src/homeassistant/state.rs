@@ -11,30 +11,54 @@
 //! uninterpretable register would be noise on the broker, and a per-pack reading for a pack that is not
 //! attached would decode to absolute zero.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde_json::{Map, Number, Value, json};
 
 use crate::control::{ConfigView, SettingView, TelemetryView};
 use crate::homeassistant::broker::Publication;
-use crate::homeassistant::entity::Entity;
 use crate::homeassistant::entity::{CELL_SPREAD, FIRMWARE_VERSION, LAST_UPDATE, RESTING_VOLTAGE, SOC_CREDIBLE};
+use crate::homeassistant::entity::{Entity, Gate};
 use crate::homeassistant::rest::Resting;
 use crate::homeassistant::topics::{OFFLINE, ONLINE};
 
-/// Which fields a device publishes.
+/// Which fields a device publishes, and the reading each one is gated on, where it is.
 #[derive(Debug, Clone, Default)]
-pub struct Fields(HashSet<&'static str>);
+pub struct Fields(HashMap<&'static str, Option<&'static str>>);
 
 impl Fields {
     /// The keys of a catalogue of entities.
     pub fn of(entities: &[Entity]) -> Self {
-        Self(entities.iter().map(|entity| entity.key).collect())
+        Self(
+            entities
+                .iter()
+                .map(|entity| {
+                    let gate = match entity.gate {
+                        Some(Gate::ReadingIsSet { reading }) => Some(reading),
+                        _ => None,
+                    };
+                    (entity.key, gate)
+                })
+                .collect(),
+        )
     }
 
     /// Whether a field has an entity reading it.
     pub fn contains(&self, key: &str) -> bool {
-        self.0.contains(key)
+        self.0.contains_key(key)
+    }
+
+    /// Whether a field is gated on a reading that this frame carries at raw 0.
+    ///
+    /// Such a field is left out of the state rather than published beside the gate that closes on it:
+    /// the availability topic is a separate message, and a figure that went out ahead of it would be
+    /// recorded before the entity turned unavailable.
+    fn closed_in(&self, key: &str, view: &TelemetryView) -> bool {
+        self.0.get(key).copied().flatten().is_some_and(|gate| {
+            view.readings
+                .iter()
+                .any(|reading| reading.name == gate && reading.raw == 0)
+        })
     }
 
     /// How many fields there are.
@@ -76,6 +100,7 @@ impl StatePayload {
                 object.insert(SOC_CREDIBLE.to_owned(), json!(if credible { "0" } else { "1" }));
             }
         }
+        object.retain(|key, _| !fields.closed_in(key, view));
         Self(object)
     }
 
@@ -360,16 +385,75 @@ mod tests {
         let view = TelemetryView {
             timestamp: None,
             readings: vec![
-                reading("ac_power", "-100"),
+                reading("pv_power_total", "-100"),
                 reading("unknown_81", "42"),
                 reading("battery_soc_total", "88"),
             ],
         };
         let payload = StatePayload::telemetry(&view, &fields(), None);
-        assert_eq!(payload.get("ac_power"), Some(&json!(-100)));
+        assert_eq!(payload.get("pv_power_total"), Some(&json!(-100)));
         assert_eq!(payload.get("battery_soc_total"), Some(&json!(88)));
         assert_eq!(payload.get("unknown_81"), None, "nothing can interpret it");
         assert_eq!(payload.len(), 2);
+    }
+
+    /// The pack count as a frame carries it.
+    fn packs(count: u16) -> ReadingView {
+        ReadingView {
+            register: 12,
+            name: "battery_pack_count",
+            raw: count,
+            value: count.to_string(),
+            unit: "",
+            confidence: "observed",
+        }
+    }
+
+    /// A frame as a NOAH sends it with or without its BMS: the battery figures are the same filler either
+    /// way here, since only the pack count decides.
+    fn waking(count: u16) -> TelemetryView {
+        TelemetryView {
+            timestamp: None,
+            readings: vec![
+                packs(count),
+                reading("battery_soc_total", "19"),
+                reading("pv_energy_total", "2928.4"),
+                reading("battery_pack_voltage", "52.23"),
+                cell("battery_cell_voltage_max", 3300),
+                cell("battery_cell_voltage_min", 3297),
+                reading("pv_power_total", "35"),
+                reading("pv1_voltage", "37.13"),
+            ],
+        }
+    }
+
+    #[test]
+    fn battery_figures_are_left_out_while_the_bms_has_not_joined() {
+        // The first half hour after a NOAH wakes on PV: pack count 0, SoC 0, cells 0 V, energy counters 0.
+        // Left out of the object, so Home Assistant never records them, while the PV side still reports.
+        let payload = StatePayload::telemetry(&waking(0), &fields(), None);
+        for key in [
+            "battery_pack_count",
+            "battery_soc_total",
+            "pv_energy_total",
+            "battery_pack_voltage",
+            "battery_cell_voltage_max",
+            "battery_cell_voltage_min",
+            CELL_SPREAD,
+        ] {
+            assert_eq!(payload.get(key), None, "{key}");
+        }
+        assert_eq!(payload.get("pv_power_total"), Some(&json!(35)));
+        assert_eq!(payload.get("pv1_voltage"), Some(&json!(37.13)));
+    }
+
+    #[test]
+    fn battery_figures_are_published_once_the_bms_has_joined() {
+        let payload = StatePayload::telemetry(&waking(1), &fields(), None);
+        assert_eq!(payload.get("battery_pack_count"), Some(&json!(1)));
+        assert_eq!(payload.get("battery_soc_total"), Some(&json!(19)));
+        assert_eq!(payload.get("pv_energy_total"), Some(&json!(2928.4)));
+        assert_eq!(payload.get(CELL_SPREAD), Some(&json!(3)));
     }
 
     #[test]

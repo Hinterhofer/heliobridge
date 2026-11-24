@@ -39,6 +39,10 @@ pub const INPUT_BASE_OFFSET: usize = 0x4F;
 /// The telemetry reading that is non-zero while the device holds a meter figure it is acting on.
 pub const METER_CONNECTED: &str = "meter_connected";
 
+/// The telemetry reading that is non-zero once the BMS has joined: the pack count, which a NOAH reports as 0
+/// for its first half hour or so after waking on PV, while every battery figure in the frame is filler.
+pub const BMS_REPORTING: &str = "battery_pack_count";
+
 /// The config register holding accessories reached over the local network.
 pub const ACCESSORY_LIST: &str = "accessory_list";
 
@@ -302,6 +306,12 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // stays at raw 0. Matched against the vendor app and the cloud's output figure to the watt (696/696,
         // 479/479 W) and at about 94–95 % of PV power while the battery was idle; the "0x0232" it showed as
         // flags was 562 W. Only `internal_faults` is replaced — this fork serves a NOAH alone.
+        // NOAH 2000: for the first 25 to 27 minutes after waking on PV the BMS has not joined, and the
+        // frame says so with `battery_pack_count` at 0. Every battery figure in those frames is filler:
+        // SoC 0, cells 0 V, pack 7–40 V, BMS limits 45 V / 3 A, cycles 0, the PV energy counters 0 and the
+        // off-grid voltage 28 V. Gated on the pack count, so they are left out of the state and show
+        // unavailable instead; the energy counters especially, which Home Assistant would read as a meter
+        // reset and count again.
         Entry::float(2, "noah_output_power", Watt, Scaling::UNIT, Observed),
         Entry::int(3, "grid_faults", Observed),
         Entry::int(4, "output_faults", Observed),
@@ -314,8 +324,8 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::enumerated(8, "work_mode", WORK_MODE_LABELS, Verified),
         Entry::enumerated(10, "battery_charge_status", BATTERY_STATUS_LABELS, Observed),
         Entry::float(11, "battery_charge_power", Watt, Scaling::SIGNED, Verified),
-        Entry::int(12, "battery_pack_count", Observed),
-        Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified),
+        Entry::int(12, "battery_pack_count", Observed).gated_by(BMS_REPORTING),
+        Entry::float(13, "battery_soc_total", Percent, Scaling::UNIT, Verified).gated_by(BMS_REPORTING),
         // The BMS's `HeatState`, relayed unchanged: bit n is set while pack n+1's heater relay is on, read
         // out of the BMS's reply builder. The heater runs only while charging, below 3.1 or 5.1 °C depending
         // on the hardware variant. Seen 0 → 1 → 0 across a heating cycle that started at 0 °C, in step with
@@ -355,8 +365,8 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::text(23, "serial_number_part_2", 2, Observed),
         Entry::text(25, "serial_number_part_3", 2, Observed),
         Entry::text(27, "serial_number_part_4", 2, Observed),
-        Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified),
-        Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
+        Entry::float(29, "battery1_soc", Percent, Scaling::UNIT, Verified).gated_by(BMS_REPORTING),
+        Entry::float(30, "battery1_temp", Celsius, Scaling::KELVIN_TENTHS, Verified).gated_by(BMS_REPORTING),
         Entry::float(41, "battery2_soc", Percent, Scaling::UNIT, Observed),
         // The per-pack block repeats every 12 registers, so the temperature of pack n sits one past its
         // state of charge. Inferred from that symmetry alone: the reference device has one pack, which
@@ -370,10 +380,10 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // so a 16-bit read of the low half alone gives the same answer today and a wrong one past
         // 6553.5 kWh. Named for what they count: another implementation calls these PV energy, and the
         // day's figures agree — production exceeds AC output by what went into the battery.
-        Entry::float32(71, "pv_energy_today", KilowattHour, Scaling::TENTHS, Verified),
-        Entry::float32(73, "pv_energy_month", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float32(75, "pv_energy_year", KilowattHour, Scaling::TENTHS, Observed),
-        Entry::float32(77, "pv_energy_total", KilowattHour, Scaling::TENTHS, Verified),
+        Entry::float32(71, "pv_energy_today", KilowattHour, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
+        Entry::float32(73, "pv_energy_month", KilowattHour, Scaling::TENTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float32(75, "pv_energy_year", KilowattHour, Scaling::TENTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float32(77, "pv_energy_total", KilowattHour, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
         // Daily counters, reset at midnight. 79 and 80 separate cleanly by the sign of register 11:
         // across 12 426 frames, 80 rose only while charging and 79 only while discharging, without
         // exception. The scaling is confirmed by capacity — 80 rising 17 over a 5..100 % climb implies
@@ -417,10 +427,10 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         Entry::float(96, "pv2_current", Ampere, Scaling::HUNDREDTHS, Observed),
         Entry::float(97, "pv2_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
         Entry::float(98, "device_temp", Celsius, Scaling::KELVIN_TENTHS, Verified),
-        Entry::float(99, "battery_cell_voltage_max", Volt, Scaling::THOUSANDTHS, Observed),
-        Entry::float(100, "battery_cell_voltage_min", Volt, Scaling::THOUSANDTHS, Observed),
-        Entry::int(101, "battery_cycles", Observed),
-        Entry::float(102, "battery_soh", Percent, Scaling::UNIT, Observed),
+        Entry::float(99, "battery_cell_voltage_max", Volt, Scaling::THOUSANDTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::float(100, "battery_cell_voltage_min", Volt, Scaling::THOUSANDTHS, Observed).gated_by(BMS_REPORTING),
+        Entry::int(101, "battery_cycles", Observed).gated_by(BMS_REPORTING),
+        Entry::float(102, "battery_soh", Percent, Scaling::UNIT, Observed).gated_by(BMS_REPORTING),
         Entry::float(103, "pv3_voltage", Volt, Scaling::HUNDREDTHS, Observed),
         Entry::float(104, "pv3_current", Ampere, Scaling::HUNDREDTHS, Observed),
         Entry::float(105, "pv3_temp", Celsius, Scaling::KELVIN_TENTHS, Verified).gated_by("pv3_temp"),
@@ -431,7 +441,7 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // The off-grid output: what the device's own socket delivers, and zero in every frame until the
         // device is put into off-grid mode. Established by connecting a lamp, then two: voltage held
         // 230.0 V, current and power both roughly doubled, and 111 matched |ac_power| to the decimal.
-        Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified),
+        Entry::float(109, "off_grid_voltage", Volt, Scaling::TENTHS, Verified).gated_by(BMS_REPORTING),
         Entry::float(110, "off_grid_current", Ampere, Scaling::new(0.01, -300.0), Verified)
             .gated_by("off_grid_current"),
         Entry::float(111, "off_grid_power", Watt, Scaling::new(0.1, -3000.0), Verified).gated_by("off_grid_power"),
@@ -473,9 +483,9 @@ pub const INPUT_REGISTERS: &[InputRegister] = {
         // 148 sits at 58.40 V (45.00 V right after a wake-up), which reads as the BMS's charge voltage
         // limit. 149 steps through 41, 21, 9, 3 and 1 A, dropping to 1 A at 97–100 % state of charge,
         // which reads as the BMS's current limit. Both of those meanings are inferred, not confirmed.
-        Entry::float(148, "battery_charge_voltage_limit", Volt, Scaling::HUNDREDTHS, Inferred),
-        Entry::float(149, "battery_current_limit", Ampere, Scaling::HUNDREDTHS, Inferred),
-        Entry::float(150, "battery_pack_voltage", Volt, Scaling::HUNDREDTHS, Observed),
+        Entry::float(148, "battery_charge_voltage_limit", Volt, Scaling::HUNDREDTHS, Inferred).gated_by(BMS_REPORTING),
+        Entry::float(149, "battery_current_limit", Ampere, Scaling::HUNDREDTHS, Inferred).gated_by(BMS_REPORTING),
+        Entry::float(150, "battery_pack_voltage", Volt, Scaling::HUNDREDTHS, Observed).gated_by(BMS_REPORTING),
     ]
 };
 

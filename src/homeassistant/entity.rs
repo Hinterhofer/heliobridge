@@ -180,6 +180,11 @@ pub const SOC_CREDIBLE: &str = "battery_soc_credible";
 /// The reading that says whether the device currently has a meter reporting.
 pub const METER_CONNECTED: &str = "meter_connected";
 
+/// The reading that is non-zero once the BMS has joined, which the figures computed from the cells wait for.
+///
+/// In this NOAH fork: the pack count, 0 for the first half hour or so after the device wakes on PV.
+pub const BMS_REPORTING: &str = "battery_pack_count";
+
 /// The reading that says whether the device is actually running off-grid, as against told to.
 pub const OFF_GRID_ACTIVE: &str = "off_grid_mode_active";
 
@@ -702,7 +707,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -728,7 +734,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -756,7 +763,8 @@ impl Entity {
             source: Some(Source::Telemetry),
             presence: Presence::Device,
             enabled: true,
-            gate: None,
+            // Computed from the cells, so filler while the BMS has not joined.
+            gate: Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
         }
     }
 
@@ -1280,8 +1288,8 @@ const NAMED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE, Shape, Source,
-        StateClass, VERSION_PARTS,
+        BMS_REPORTING, Catalogue, Category, Component, Entity, Gate, HEATER_STATE, METER_CONNECTED, OFF_GRID_ACTIVE,
+        Shape, Source, StateClass, VERSION_PARTS,
     };
     use crate::growatt::driver::Growatt;
     use crate::growatt::v7::registers::{
@@ -1707,6 +1715,47 @@ mod tests {
         }
         assert_eq!(reading("noah_output_power").gate, None);
         assert_eq!(reading("pv1_temp").gate, None);
+    }
+
+    #[test]
+    fn battery_figures_wait_for_the_bms_to_join() {
+        // A NOAH reports 0 packs for its first half hour after waking on PV, with filler in every battery
+        // figure beside it, so each of them is gated on the pack count.
+        for key in [
+            "battery_pack_count",
+            "battery_soc_total",
+            "battery1_soc",
+            "battery1_temp",
+            "pv_energy_today",
+            "pv_energy_month",
+            "pv_energy_year",
+            "pv_energy_total",
+            "battery_cell_voltage_max",
+            "battery_cell_voltage_min",
+            "battery_cycles",
+            "battery_soh",
+            "off_grid_voltage",
+            "battery_charge_voltage_limit",
+            "battery_current_limit",
+            "battery_pack_voltage",
+        ] {
+            assert_eq!(
+                reading(key).gate,
+                Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
+                "{key}"
+            );
+        }
+        for entity in [Entity::cell_spread(), Entity::resting_voltage(), Entity::soc_credible()] {
+            assert_eq!(
+                entity.gate,
+                Some(Gate::ReadingIsSet { reading: BMS_REPORTING }),
+                "{}",
+                entity.key
+            );
+        }
+        // The PV side reports before the BMS joins, and is right.
+        assert_eq!(reading("pv_power_total").gate, None);
+        assert_eq!(reading("pv1_voltage").gate, None);
     }
 
     #[test]

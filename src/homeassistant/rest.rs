@@ -96,8 +96,12 @@ impl RestWatch {
             .find(|reading| reading.name == "battery_charge_power")
             .and_then(|reading| reading.value.parse::<f64>().ok());
 
+        // A NOAH reports 0 packs until its BMS has joined, and 0 V cells beside it; sampling those would
+        // publish a resting voltage of 0 and a verdict on it.
+        let bms = reading("battery_pack_count").is_none_or(|count| count != 0);
+
         match watts {
-            Some(watts) if watts.abs() <= IDLE_WATTS => {
+            Some(watts) if bms && watts.abs() <= IDLE_WATTS => {
                 let since = *self.since.get_or_insert(now);
                 if let (Some(low), Some(soc)) = (reading("battery_cell_voltage_min"), reading("battery_soc_total"))
                     && now.saturating_duration_since(since) >= SETTLE
@@ -137,7 +141,50 @@ fn credible(millivolts: u16, soc: f64) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLAIMS_EMPTY, HIGH_PLATEAU, LOW_KNEE, credible};
+    use super::{CLAIMS_EMPTY, HIGH_PLATEAU, LOW_KNEE, RestWatch, SETTLE, credible};
+    use crate::control::{ReadingView, TelemetryView};
+    use tokio::time::Instant;
+
+    fn raw(name: &'static str, raw: u16, value: &str) -> ReadingView {
+        ReadingView {
+            register: 0,
+            name,
+            raw,
+            value: value.to_owned(),
+            unit: "",
+            confidence: "observed",
+        }
+    }
+
+    /// An idle frame: the battery neither charging nor discharging.
+    fn idle(packs: u16, millivolts: u16, soc: u16) -> TelemetryView {
+        TelemetryView {
+            timestamp: None,
+            readings: vec![
+                raw("battery_pack_count", packs, &packs.to_string()),
+                raw("battery_charge_power", 0, "0"),
+                raw("battery_cell_voltage_min", millivolts, "0"),
+                raw("battery_soc_total", soc, &soc.to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn nothing_is_sampled_while_the_bms_has_not_joined() {
+        // A NOAH waking on PV reports 0 packs with 0 V cells and SoC 0 for half an hour, all of it idle.
+        let mut watch = RestWatch::default();
+        let start = Instant::now();
+        assert_eq!(watch.observe(&idle(0, 0, 0), start), None);
+        assert_eq!(watch.observe(&idle(0, 0, 0), start + SETTLE + SETTLE), None);
+
+        // Once it has, the pack has to rest its own full interval before a sample is taken.
+        let joined = start + SETTLE + SETTLE;
+        assert_eq!(watch.observe(&idle(1, 3297, 19), joined), None);
+        let sample = watch
+            .observe(&idle(1, 3297, 19), joined + SETTLE)
+            .expect("a resting sample");
+        assert_eq!(sample.millivolts, 3297);
+    }
 
     #[test]
     fn a_low_percentage_is_only_credible_at_the_knee() {
